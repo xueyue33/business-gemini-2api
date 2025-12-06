@@ -563,7 +563,7 @@ def create_jwt(key_bytes: bytes, key_id: str, csesidx: str) -> str:
 
 
 def get_jwt_for_account(account: dict, proxy: str) -> str:
-    """为指定账号获取JWT"""
+    """为指定账号获取JWT - 支持新的Google认证流程"""
     secure_c_ses = account.get("secure_c_ses")
     host_c_oses = account.get("host_c_oses")
     csesidx = account.get("csesidx")
@@ -574,23 +574,87 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
     url = f"{GETOXSRF_URL}?csesidx={csesidx}"
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
+    # 构建 Cookie 字符串，包含额外的 Cookie（用于新认证流程）
+    cookie_parts = [f'__Secure-C_SES={secure_c_ses}', f'__Host-C_OSES={host_c_oses}']
+    extra_cookies = account.get("extra_cookies", {})
+    if extra_cookies:
+        for name, value in extra_cookies.items():
+            if name and value:
+                cookie_parts.append(f'{name}={value}')
+    cookie_str = "; ".join(cookie_parts)
+
     headers = {
         "accept": "*/*",
         "user-agent": account.get('user_agent', 'Mozilla/5.0'),
-        "cookie": f'__Secure-C_SES={secure_c_ses}; __Host-C_OSES={host_c_oses}',
+        "cookie": cookie_str,
+        "origin": "https://business.gemini.google",
+        "referer": "https://business.gemini.google/",
     }
 
     try:
-        resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30)
+        # 第一步：请求 getoxsrf（不跟随重定向）
+        resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
     except requests.RequestException as e:
         raise AccountRequestError(f"获取JWT 请求失败: {e}") from e
+
+    # 如果是302重定向到refreshcookies，需要处理新的认证流程
+    if resp.status_code == 302:
+        location = resp.headers.get("Location", "")
+        if "refreshcookies" in location:
+            print(f"[DEBUG] 检测到新认证流程，重定向到: {location[:100]}...")
+            try:
+                # 第二步：请求 refreshcookies
+                resp2 = requests.get(location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                if resp2.status_code != 200:
+                    raise AccountAuthError(f"refreshcookies 请求失败: {resp2.status_code}")
+                
+                text2 = resp2.text
+                if text2.startswith(")]}'\\n") or text2.startswith(")]}'"):
+                    text2 = text2[4:].strip()
+                
+                data2 = json.loads(text2)
+                setocookie_url_b64 = data2.get("setocookieUrl")
+                if not setocookie_url_b64:
+                    raise AccountAuthError(f"refreshcookies 响应缺少 setocookieUrl: {data2}")
+                
+                # 解码 setocookieUrl
+                padding = 4 - len(setocookie_url_b64) % 4
+                if padding != 4:
+                    setocookie_url_b64 += '=' * padding
+                setocookie_url = base64.urlsafe_b64decode(setocookie_url_b64).decode('utf-8')
+                print(f"[DEBUG] setocookie URL: {setocookie_url[:100]}...")
+                
+                # 第三步：请求 setocookie（不跟随重定向）
+                resp3 = requests.get(setocookie_url, headers=headers, proxies=proxies, verify=False, timeout=30, allow_redirects=False)
+                
+                # setocookie 可能返回302重定向回 getoxsrf，也可能直接返回结果
+                if resp3.status_code == 302:
+                    final_location = resp3.headers.get("Location", "")
+                    if "getoxsrf" in final_location:
+                        # 最终请求 getoxsrf
+                        resp = requests.get(final_location, headers=headers, proxies=proxies, verify=False, timeout=30)
+                    else:
+                        raise AccountAuthError(f"setocookie 重定向到未知地址: {final_location}")
+                elif resp3.status_code == 200:
+                    resp = resp3
+                else:
+                    raise AccountAuthError(f"setocookie 请求失败: {resp3.status_code} - {resp3.text[:200]}")
+                    
+            except json.JSONDecodeError as e:
+                raise AccountAuthError(f"解析refreshcookies响应失败: {e}") from e
+            except Exception as e:
+                if isinstance(e, (AccountAuthError, AccountRequestError)):
+                    raise
+                raise AccountAuthError(f"新认证流程失败: {e}") from e
+        else:
+            raise AccountAuthError(f"获取JWT 302重定向到未知地址: {location}")
 
     if resp.status_code != 200:
         raise_for_account_response(resp, "获取JWT")
 
     # 处理Google安全前缀
     text = resp.text
-    if text.startswith(")]}'\n") or text.startswith(")]}'"): 
+    if text.startswith(")]}'\\n") or text.startswith(")]}'"):
         text = text[4:].strip()
 
     try:
@@ -610,9 +674,32 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
     return create_jwt(key_bytes, key_id, csesidx)
 
 
-def get_headers(jwt: str) -> dict:
-    """获取请求头"""
-    return {
+def build_cookie_string(account: dict) -> str:
+    """从账号配置构建完整的 Cookie 字符串"""
+    if not account:
+        return ""
+    
+    cookie_parts = []
+    
+    # 主要 Cookie
+    if account.get("secure_c_ses"):
+        cookie_parts.append(f'__Secure-C_SES={account["secure_c_ses"]}')
+    if account.get("host_c_oses"):
+        cookie_parts.append(f'__Host-C_OSES={account["host_c_oses"]}')
+    
+    # 额外的 Cookie
+    extra_cookies = account.get("extra_cookies", {})
+    if extra_cookies:
+        for name, value in extra_cookies.items():
+            if name and value:
+                cookie_parts.append(f'{name}={value}')
+    
+    return "; ".join(cookie_parts)
+
+
+def get_headers(jwt: str, account: dict = None) -> dict:
+    """获取请求头，可选包含 Cookie"""
+    headers = {
         "accept": "*/*",
         "accept-encoding": "gzip, deflate, br, zstd",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -623,6 +710,14 @@ def get_headers(jwt: str) -> dict:
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
         "x-server-timeout": "1800",
     }
+    
+    # 如果提供了账号配置，添加 Cookie
+    if account:
+        cookie_str = build_cookie_string(account)
+        if cookie_str:
+            headers["cookie"] = cookie_str
+    
+    return headers
 
 
 def raise_for_account_response(resp: requests.Response, action: str):
@@ -664,7 +759,7 @@ def ensure_jwt_for_account(account_idx: int, account: dict):
         return state["jwt"]
 
 
-def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
+def create_chat_session(jwt: str, team_id: str, proxy: str, account: dict = None) -> str:
     """创建会话，返回session ID"""
     print(f"[DEBUG][create_chat_session] 开始 - team_id: {team_id}")
     start_time = time.time()
@@ -686,7 +781,7 @@ def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
     try:
         resp = requests.post(
             CREATE_SESSION_URL,
-            headers=get_headers(jwt),
+            headers=get_headers(jwt, account),
             json=body,
             proxies=proxies,
             verify=False,
@@ -725,7 +820,7 @@ def ensure_session_for_account(account_idx: int, account: dict):
             proxy = get_proxy()
             team_id = account.get("team_id")
             session_start = time.time()
-            state["session"] = create_chat_session(jwt, team_id, proxy)
+            state["session"] = create_chat_session(jwt, team_id, proxy, account)
             print(f"[DEBUG][ensure_session_for_account] Session创建完成 - 耗时: {time.time() - session_start:.2f}秒")
         else:
             print(f"[DEBUG][ensure_session_for_account] 使用缓存session: {state['session']}")
@@ -1082,7 +1177,7 @@ def upload_inline_image_to_gemini(jwt: str, session_name: str, team_id: str,
 
 
 def stream_chat_with_images(jwt: str, sess_name: str, message: str, 
-                            proxy: str, team_id: str, file_ids: List[str] = None) -> ChatResponse:
+                            proxy: str, team_id: str, file_ids: List[str] = None, account: dict = None) -> ChatResponse:
     """发送消息并流式接收响应"""
     query_parts = [{"text": message}]
     request_file_ids = file_ids if file_ids else []
@@ -1112,10 +1207,11 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str,
     }
 
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    
     try:
         resp = requests.post(
             STREAM_ASSIST_URL,
-            headers=get_headers(jwt),
+            headers=get_headers(jwt, account),
             json=body,
             proxies=proxies,
             verify=False,
@@ -1681,7 +1777,7 @@ def chat_completions():
                     if uploaded_file_id:
                         gemini_file_ids.append(uploaded_file_id)
                 
-                chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids)
+                chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids, account)
             except (AccountRateLimitError, AccountAuthError, AccountRequestError) as e:
                 last_error = e
                 account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
@@ -1714,7 +1810,7 @@ def chat_completions():
                         if uploaded_file_id:
                             gemini_file_ids.append(uploaded_file_id)
                     
-                    chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids)
+                    chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids, account)
                     break
                 except AccountRateLimitError as e:
                     last_error = e

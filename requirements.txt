@@ -10,3 +10,6 @@ requests>=2.25.0
 
 # SSL警告处理（requests依赖）
 urllib3>=1.26.0
+
+# 可选：用于从浏览器获取 Cookie (CDP)
+websocket-client>=1.0.0
