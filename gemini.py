@@ -1463,12 +1463,16 @@ def stream_chat_realtime(jwt: str, sess_name: str, message: str,
     # 已输出的文本内容（用于去重）
     output_texts = []
     
+    # 用于累积完整响应以解析图片
+    full_response_buffer = ""
+    
     # 使用 iter_lines 接收数据（通常更快）
     for line in resp.iter_lines(decode_unicode=True):
         if line:
             if isinstance(line, bytes):
                 line = line.decode('utf-8', errors='replace')
             buffer += line
+            full_response_buffer += line + "\n"
             
             # 查找所有 "text":"..." 匹配
             for match in text_pattern.finditer(buffer):
@@ -1518,6 +1522,102 @@ def stream_chat_realtime(jwt: str, sess_name: str, message: str,
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     
+    # --- 循环结束，开始补漏图片 ---
+    try:
+        # 尝试解析完整 JSON 以提取图片
+        data_list = json.loads(full_response_buffer)
+        temp_result = ChatResponse()
+        img_file_ids = []
+        current_session = None
+        
+        for data in data_list:
+            sar = data.get("streamAssistResponse")
+            if not sar: continue
+            
+            # 获取 session 用于下载
+            session_info = sar.get("sessionInfo", {})
+            if session_info.get("session"):
+                current_session = session_info["session"]
+
+            # 1. 提取 generatedImages
+            for gen_img in sar.get("generatedImages", []):
+                parse_generated_image(gen_img, temp_result, proxy)
+            
+            answer = sar.get("answer") or {}
+            for gen_img in answer.get("generatedImages", []):
+                parse_generated_image(gen_img, temp_result, proxy)
+                
+            for reply in answer.get("replies", []):
+                for gen_img in reply.get("generatedImages", []):
+                    parse_generated_image(gen_img, temp_result, proxy)
+                
+                # 2. 提取 fileId 引用
+                gc = reply.get("groundedContent", {})
+                content = gc.get("content", {})
+                file_info = content.get("file")
+                if file_info and file_info.get("fileId"):
+                    img_file_ids.append({
+                        "fileId": file_info["fileId"],
+                        "mimeType": file_info.get("mimeType", "image/png"),
+                        "fileName": file_info.get("name")
+                    })
+                # 3. 提取 inlineData / attachments
+                parse_image_from_content(content, temp_result, proxy)
+                parse_image_from_content(gc, temp_result, proxy)
+                for att in reply.get("attachments", []) + gc.get("attachments", []) + content.get("attachments", []):
+                    parse_attachment(att, temp_result, proxy)
+
+        # 下载通过 fileId 引用的图片
+        if img_file_ids and current_session:
+            try:
+                file_metadata = get_session_file_metadata(jwt, current_session, team_id, proxy)
+                for finfo in img_file_ids:
+                    fid = finfo["fileId"]
+                    mime = finfo["mimeType"]
+                    fname = finfo.get("fileName")
+                    meta = file_metadata.get(fid)
+                    session_path = meta.get("session") if meta else current_session
+                    
+                    try:
+                        image_data = download_file_with_jwt(jwt, session_path, fid, proxy)
+                        filename = None
+                        b64_data = base64.b64encode(image_data).decode("utf-8")
+                        
+                        if not is_base64_output_mode():
+                            filename = save_image_to_cache(image_data, mime, fname)
+                            
+                        img = ChatImage(file_id=fid, file_name=filename, mime_type=mime, base64_data=b64_data)
+                        temp_result.images.append(img)
+                    except Exception as e:
+                        print(f"[流式补图] 下载失败: {e}")
+            except Exception:
+                pass
+
+        # 如果找到了图片，构造 Markdown 并发送
+        if temp_result.images:
+            image_markdown = build_openai_response_content(ChatResponse(text="", images=temp_result.images), "")
+            # build_openai_response_content 会在开头加换行，我们为了美观直接发送
+            # 这里 host_url 传空字符串，依靠 get_image_base_url 里的配置或相对路径回退
+            
+            if image_markdown.strip():
+                # 发送图片链接块
+                img_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "account_csesidx": account_csesidx,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "\n" + image_markdown.strip()},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(img_chunk, ensure_ascii=False)}\n\n"
+
+    except Exception as e:
+        print(f"[流式补图] 处理异常: {e}")
+
     # 发送结束标记
     end_chunk = {
         "id": chunk_id,
